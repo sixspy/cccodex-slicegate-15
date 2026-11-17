@@ -29,10 +29,19 @@
   .mono{font-family:Consolas,"Courier New",monospace}
   .tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;background:#1b2a22;color:var(--ok)}
   .tag.bad{background:#2a1518;color:var(--bad)}
+  .tag.warn{background:#2a2415;color:#ffd166}
   .login{max-width:400px;margin:12vh auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px}
   .err{color:var(--bad);min-height:18px;font-size:13px}
+  .ok{color:var(--ok);min-height:18px;font-size:13px}
+  .muted{color:var(--muted);font-size:12px}
   .kpi{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px}
   .kpi .panel{padding:12px}.kpi b{display:block;font-size:22px;margin-top:4px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+  .chip{border:1px solid var(--line);border-radius:999px;padding:4px 10px;font-size:12px;color:var(--muted)}
+  .chip b{color:var(--text);margin-left:4px}
+  .chip.bad{border-color:#5b2121;color:var(--bad)}.chip.bad b{color:var(--bad)}
+  .check{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);margin:4px 0 10px}
+  .check input{width:auto;margin:0}
 </style>
 </head>
 <body>
@@ -54,13 +63,16 @@ createApp({
   setup(){
     const token=ref(localStorage.getItem('slicegate_token')||'');
     const user=ref(localStorage.getItem('slicegate_user')||'');
-    const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
+    const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref(''), okMsg=ref('');
     const slices=ref([]), releases=ref([]), watermarks=ref([]);
+    const notifications=ref([]), policy=ref(null), reconcile=ref(null);
+    const policyMode=ref('甲'), mockFail=ref(false);
     const form=ref({slice_no:'SL-2026-11-03-east',biz_date:'2026-11-03',partition_key:'east',row_count:1000,expected_count:1000});
     const releaseSliceId=ref(1), consumer=ref('ads_order');
-    const nav=['切片登记','完整度裁决','下游放行','消费水位'];
+    const nav=['切片登记','完整度裁决','下游放行','消费水位','通知队列'];
     const completeCnt=computed(()=>slices.value.filter(s=>s.completeness==='完整').length);
     const openCnt=computed(()=>slices.value.filter(s=>s.release_status!=='已放行').length);
+    const pendingCnt=computed(()=>notifications.value.filter(n=>n.status==='待投递'||n.status==='投递失败').length);
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
       err.value='';
@@ -85,13 +97,41 @@ createApp({
       releases.value=Array.isArray(rel.items)?rel.items:[];
       const w=await loadJson('/api/watermarks'); if(w===null) return;
       watermarks.value=Array.isArray(w.items)?w.items:[];
+      const nf=await loadJson('/api/notifications'); if(nf===null) return;
+      notifications.value=Array.isArray(nf.items)?nf.items:[];
+      policy.value=nf.policy||null;
+      const rc=await loadJson('/api/reconcile'); if(rc===null) return;
+      reconcile.value=rc;
       if(slices.value.length) releaseSliceId.value=slices.value[0].id;
     }
-    async function createSlice(){actionErr.value='';const r=await fetch('/api/slices',{method:'POST',headers:auth(),body:JSON.stringify(form.value)});const j=await r.json();if(!r.ok)actionErr.value=j.detail||'失败';await refresh();}
+    async function createSlice(){actionErr.value='';okMsg.value='';const r=await fetch('/api/slices',{method:'POST',headers:auth(),body:JSON.stringify(form.value)});const j=await r.json();if(!r.ok)actionErr.value=j.detail||'失败';await refresh();}
     async function evaluate(id){await fetch('/api/slices/'+id+'/evaluate',{method:'POST',headers:auth()});await refresh();}
-    async function doRelease(){actionErr.value='';const r=await fetch('/api/slices/'+releaseSliceId.value+'/release',{method:'POST',headers:auth(),body:JSON.stringify({consumer:consumer.value})});const j=await r.json();if(!r.ok)actionErr.value=j.detail||'放行失败';await refresh();}
+    async function doRelease(){
+      actionErr.value='';okMsg.value='';
+      const r=await fetch('/api/slices/'+releaseSliceId.value+'/release',{method:'POST',headers:auth(),body:JSON.stringify({consumer:consumer.value})});
+      const j=await r.json().catch(()=>({}));
+      if(!r.ok){actionErr.value=j.detail||'放行失败';}
+      else{okMsg.value='放行成功：通知#'+j.notification_id+' 已随同事务落账（'+j.notification_status+'·口径'+j.mode+'），待值班投递';}
+      await refresh();
+    }
+    async function savePolicy(){
+      actionErr.value='';okMsg.value='';
+      const r=await fetch('/api/notifications/policy',{method:'PUT',headers:auth(),body:JSON.stringify({mode:policyMode.value})});
+      const j=await r.json().catch(()=>({}));
+      if(!r.ok){actionErr.value=j.detail||'失败';}
+      else{okMsg.value=j.note||'口径既定，未变更';}
+      await refresh();
+    }
+    async function dispatch(n){
+      actionErr.value='';okMsg.value='';
+      const r=await fetch('/api/notifications/'+n.id+'/dispatch',{method:'POST',headers:auth(),body:JSON.stringify({simulate_failure:mockFail.value})});
+      const j=await r.json().catch(()=>({}));
+      if(!r.ok){actionErr.value=j.detail||'投递失败';}
+      else{okMsg.value='通知#'+n.id+' 已投递（第'+j.attempt+'次，口径'+j.mode+'）';}
+      await refresh();
+    }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,slices,releases,watermarks,form,releaseSliceId,consumer,actionErr,completeCnt,openCnt,login,logout,createSlice,evaluate,doRelease};
+    return {token,user,username,password,err,tab,nav,slices,releases,watermarks,notifications,policy,reconcile,policyMode,mockFail,form,releaseSliceId,consumer,actionErr,okMsg,completeCnt,openCnt,pendingCnt,login,logout,createSlice,evaluate,doRelease,savePolicy,dispatch};
   },
   template:`
   <div v-if="!token" class="login">
@@ -101,7 +141,7 @@ createApp({
   </div>
   <div v-if="token">
     <div class="top">
-      <div class="brand">日切放行<small>切片 → 完整度 → 放行 → 水位</small></div>
+      <div class="brand">日切放行<small>切片 → 完整度 → 放行 → 水位 → 通知投递闭环</small></div>
       <div class="tabs"><button v-for="(n,i) in nav" :key="n" :class="{on:tab===i}" @click="tab=i">{{n}}</button></div>
       <div class="user">{{user}}</div><button class="ghost" @click="logout">退出</button>
     </div>
@@ -109,7 +149,7 @@ createApp({
       <div class="kpi">
         <div class="panel">切片总数<b class="mono">{{slices.length}}</b></div>
         <div class="panel">已完整<b class="mono">{{completeCnt}}</b></div>
-        <div class="panel">未放行<b class="mono">{{openCnt}}</b></div>
+        <div class="panel">待投递通知<b class="mono">{{pendingCnt}}</b></div>
       </div>
       <div v-show="tab===0" class="grid">
         <div class="panel">
@@ -145,18 +185,68 @@ createApp({
           <label>切片</label><select v-model.number="releaseSliceId"><option v-for="s in slices" :value="s.id">{{s.slice_no}}（{{s.completeness}}）</option></select>
           <label>下游</label><input v-model="consumer"/>
           <button class="primary" @click="doRelease">放行</button>
-          <div class="err">{{actionErr}}</div>
+          <div class="muted">口径甲：成功放行、推水位、落待投递通知同一事务，任一步失败整笔回滚</div>
+          <div class="err">{{actionErr}}</div><div class="ok">{{okMsg}}</div>
         </div>
         <div class="panel">
           <h2>放行流水</h2>
-          <table><thead><tr><th>切片</th><th>下游</th><th>结果</th><th>时间</th></tr></thead>
-          <tbody><tr v-for="r in releases" :key="r.id"><td class="mono">{{r.slice_no}}</td><td>{{r.consumer}}</td><td>{{r.status}}</td><td class="mono">{{r.created_at}}</td></tr></tbody></table>
+          <table><thead><tr><th>切片</th><th>下游</th><th>结果</th><th>通知账</th><th>时间</th></tr></thead>
+          <tbody><tr v-for="r in releases" :key="r.id"><td class="mono">{{r.slice_no}}</td><td>{{r.consumer}}</td><td>{{r.status}}</td>
+            <td><span v-if="r.notification_status" class="tag" :class="{bad:r.notification_status==='投递失败',warn:r.notification_status==='待投递'}">{{r.notification_status}}·{{r.notification_mode}}</span><span v-else>—</span></td>
+            <td class="mono">{{r.created_at}}</td></tr></tbody></table>
         </div>
       </div>
       <div v-show="tab===3" class="panel">
         <h2>消费水位</h2>
         <table><thead><tr><th>消费方</th><th>业务日</th><th>水位</th><th>来源切片</th></tr></thead>
         <tbody><tr v-for="w in watermarks" :key="w.id"><td>{{w.consumer}}</td><td>{{w.biz_date}}</td><td class="mono">{{w.watermark}}</td><td class="mono">{{w.source_slice}}</td></tr></tbody></table>
+      </div>
+      <div v-show="tab===4">
+        <div class="grid">
+          <div class="panel">
+            <h2>通知策略簿</h2>
+            <div v-if="policy">
+              <div class="chips"><span class="chip">当前口径<b>{{policy.mode}}</b></span><span class="chip">定口人<b>{{policy.decided_by}}</b></span><span class="chip">定口日<b class="mono">{{policy.decided_day}}</b></span></div>
+              <div class="muted" style="margin-bottom:8px">{{policy.mode_desc}}</div>
+              <div class="muted" style="margin-bottom:8px">选定已写进策略簿，当天不许换；偏离策略簿即拒并写明「通知口径偏了」。</div>
+            </div>
+            <label>申请口径</label>
+            <select v-model="policyMode"><option value="甲">甲 · 同事务落账</option><option value="乙">乙 · 独立投递队列</option></select>
+            <button class="primary" @click="savePolicy">写入策略簿</button>
+            <div class="err">{{actionErr}}</div><div class="ok">{{okMsg}}</div>
+          </div>
+          <div class="panel">
+            <h2>账实对账（队列 × 策略 × 放行 × 水位）</h2>
+            <div v-if="reconcile" class="chips">
+              <span class="chip">成功放行<b>{{reconcile.summary['成功放行数']}}</b></span>
+              <span class="chip">通知账<b>{{reconcile.summary['通知账数']}}</b></span>
+              <span class="chip">已投递<b>{{reconcile.summary['已投递']}}</b></span>
+              <span class="chip">待投递<b>{{reconcile.summary['待投递']}}</b></span>
+              <span class="chip">投递失败<b>{{reconcile.summary['投递失败']}}</b></span>
+              <span class="chip">水位账<b>{{reconcile.summary['水位账数']}}</b></span>
+              <span class="chip" :class="{bad:reconcile.summary['异常数']>0}">异常<b>{{reconcile.summary['异常数']}}</b></span>
+            </div>
+            <table v-if="reconcile"><thead><tr><th>切片</th><th>下游</th><th>通知态</th><th>口径</th><th>水位</th><th>核对</th></tr></thead>
+            <tbody><tr v-for="r in reconcile.rows" :key="r.release_id">
+              <td class="mono">{{r.slice_no}}</td><td>{{r.consumer}}</td>
+              <td>{{r.notification_status||'—'}}</td><td>{{r.notification_mode||'—'}}</td>
+              <td class="mono">{{r.watermark||'—'}}</td>
+              <td><span class="tag" :class="{bad:!r.ok}">{{r.ok?'账实相符':r.issues.join('；')}}</span></td>
+            </tr></tbody></table>
+          </div>
+        </div>
+        <div class="panel" style="margin-top:14px">
+          <h2>通知队列</h2>
+          <label class="check"><input type="checkbox" v-model="mockFail"/> 演练：模拟下游无回执（失败记失败账、可重试，绝不把未投递标成已通知）</label>
+          <table><thead><tr><th>通知</th><th>切片</th><th>下游</th><th>状态</th><th>口径旁注</th><th>尝试</th><th>经手值班</th><th>投递时间</th><th>最近错误</th><th></th></tr></thead>
+          <tbody><tr v-for="n in notifications" :key="n.id">
+            <td class="mono">#{{n.id}}</td><td class="mono">{{n.slice_no}}</td><td>{{n.consumer}}</td>
+            <td><span class="tag" :class="{bad:n.status==='投递失败',warn:n.status==='待投递'||n.status==='投递中'}">{{n.status}}</span></td>
+            <td>{{n.mode}}</td><td class="mono">{{n.attempts}}</td><td>{{n.claimed_by||'—'}}</td>
+            <td class="mono">{{n.delivered_at||'—'}}</td><td>{{n.last_error||'—'}}</td>
+            <td><button class="ghost" v-if="n.status==='待投递'||n.status==='投递失败'" @click="dispatch(n)">投递</button></td>
+          </tr></tbody></table>
+        </div>
       </div>
     </main>
   </div>`
